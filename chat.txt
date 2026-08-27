@@ -1,0 +1,24 @@
+
+instead of runnig the code by yourself create a sh file for the command I wll run the code an then make sure If I face eny error I can give the error to you easily
+
+I’m switching from implementation to a runnable wrapper. I’ll mirror the repo’s existing launch style, then make the script capture stdout/stderr into a log file so you can paste errors back without digging through terminal history.
+
+I’m adding a wrapper script that generates a temporary RL-enabled config, launches the existing training entrypoint, and tees all output to a timestamped log. That gives you one command to run and one log file to paste back if anything fails.
+
+Created run_rl_mask.sh
+
+The first draft of the script needs one cleanup: I want the argument handling simpler so it can’t eat the config path or device argument by accident. I’m tightening it to a single optional config path plus an optional VJEPA_DEVICE environment override.
+
+I’ve finished the wrapper and I’m doing a static check on the edited Python files now. That should catch syntax or obvious integration errors without launching training.
+
+Checked train.py, trajectory_rl.py, utils.py, 7 problems found
+
+The editor can’t resolve torch in this workspace environment, so the static checker isn’t useful for actual correctness here. I’m doing a targeted read of the edited hunks instead to catch logic mistakes in the selection and policy update path.
+
+I found one real bug in the train loop: the policy gradient-clip variable name shadows the main optimizer clip setting. I’m renaming that so the existing JEPA clipping logic doesn’t break at runtime.
+
+The Python logic is now consistent after the clip-clip fix. I’m doing one last cheap validation on the shell wrapper itself so the command file is syntactically safe before I hand it over.
+
+Created a run wrapper at run_rl_mask.sh. It generates a temporary config with RL masking enabled, launches the existing training entrypoint, and tees all output into a timestamped log under Jepa-logs so you can paste the error back easily if it fails.
+
+The RL masking code is already wired into train.py and the new policy module is in trajectory_rl.py. I also checked the shell script syntax; I did not launch training itself. If you want, I can next make the wrapper accept a device list or point it at a specific config checkpoint path.

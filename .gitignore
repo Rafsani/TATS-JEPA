@@ -1,0 +1,16 @@
+vjepa_env
+dataset/
+__pycache__/
+*.pyc
+*.pyo
+
+# model checkpoints / weights
+*.pth
+*.pth.tar
+*.ckpt
+
+# training run outputs
+*.log
+jepa/Jepa-logs/
+jepa/Jepa-logs-traj/
+jepa/pre-trained/
