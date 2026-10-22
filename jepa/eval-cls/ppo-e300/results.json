@@ -1,0 +1,41 @@
+{
+  "checkpoint": "Jepa-logs-ppo/jepa-ppo-latest.pth.tar",
+  "checkpoint_key": "target_encoder",
+  "pretrain_epoch": 300,
+  "selected": {
+    "wd": 0.1,
+    "epoch": 25,
+    "score": 0.7133493073342697
+  },
+  "select_metric": "balanced_acc",
+  "val": {
+    "acc": 0.6968641114982579,
+    "balanced_acc": 0.7133493073342697,
+    "precision": 0.8354898336414048,
+    "recall": 0.5664160401002506,
+    "specificity": 0.8602825745682888,
+    "f1": 0.6751306945481702,
+    "auroc": 0.8084828928679627,
+    "tp": 904,
+    "tn": 1096,
+    "fp": 178,
+    "fn": 692,
+    "num_frames": 2870,
+    "majority_class_acc": 0.5560975609756098
+  },
+  "test": {
+    "acc": 0.6166185804962493,
+    "balanced_acc": 0.6013593963308728,
+    "precision": 0.6338807568725455,
+    "recall": 0.7364164247200332,
+    "specificity": 0.4663023679417122,
+    "f1": 0.6813123561013047,
+    "auroc": 0.6467740772651326,
+    "tp": 3551,
+    "tn": 1792,
+    "fp": 2051,
+    "fn": 1271,
+    "num_frames": 8665,
+    "majority_class_acc": 0.5564916330063474
+  }
+}

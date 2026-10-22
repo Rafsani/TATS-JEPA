@@ -1,0 +1,41 @@
+{
+  "checkpoint": "random_init",
+  "checkpoint_key": "target_encoder",
+  "pretrain_epoch": null,
+  "selected": {
+    "wd": 0.0,
+    "epoch": 20,
+    "score": 0.7097585997961938
+  },
+  "select_metric": "balanced_acc",
+  "val": {
+    "acc": 0.6916376306620209,
+    "balanced_acc": 0.7097585997961938,
+    "precision": 0.8421559191530318,
+    "recall": 0.5482456140350878,
+    "specificity": 0.8712715855572999,
+    "f1": 0.6641366223908918,
+    "auroc": 0.8337230930544571,
+    "tp": 875,
+    "tn": 1110,
+    "fp": 164,
+    "fn": 721,
+    "num_frames": 2870,
+    "majority_class_acc": 0.5560975609756098
+  },
+  "test": {
+    "acc": 0.6048470859780727,
+    "balanced_acc": 0.5601147399598487,
+    "precision": 0.5893633341856302,
+    "recall": 0.9560348403152219,
+    "specificity": 0.16419463960447567,
+    "f1": 0.7291996203732997,
+    "auroc": 0.694086340762096,
+    "tp": 4610,
+    "tn": 631,
+    "fp": 3212,
+    "fn": 212,
+    "num_frames": 8665,
+    "majority_class_acc": 0.5564916330063474
+  }
+}

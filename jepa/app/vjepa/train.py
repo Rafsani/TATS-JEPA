@@ -36,6 +36,15 @@ from src.masks.trajectory_rl import (
     sample_trajectory_masks,
     unwrap_policy,
 )
+from src.masks.tats_ppo import (
+    TATSPolicy,
+    PPORolloutBuffer,
+    ppo_update,
+    policy_entropy as tats_policy_entropy,
+    sample_random_masks,
+    sample_tats_masks,
+    token_log_probs,
+)
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed, AllReduce
 from src.utils.logging import (
@@ -99,6 +108,13 @@ def main(args, resume_preempt=False):
     cfgs_mask = args.get('mask')
     cfgs_rl_mask = args.get('rl_mask', {}) or {}
     use_rl_mask = cfgs_rl_mask.get('enabled', False)
+    # -- 'reinforce': motion-energy block-placement policy (trajectory_rl.py)
+    # -- 'ppo': TATS trajectory-attention token sampler trained with PPO (tats_ppo.py)
+    rl_algo = cfgs_rl_mask.get('algo', 'reinforce')
+    if use_rl_mask and rl_algo not in ('reinforce', 'ppo'):
+        raise ValueError(f'Unknown rl_mask.algo {rl_algo}; expected reinforce or ppo')
+    use_ppo_mask = use_rl_mask and rl_algo == 'ppo'
+    cfgs_ppo = cfgs_rl_mask.get('ppo', {}) or {}
 
     # -- MODEL
     cfgs_model = args.get('model')
@@ -261,7 +277,42 @@ def main(args, resume_preempt=False):
     policy_baseline = None
     grid_depth = num_frames // tubelet_size
     grid_size = crop_size // patch_size
-    if use_rl_mask:
+    if use_ppo_mask:
+        logger.info('Initializing TATS trajectory-attention mask policy (PPO)')
+        num_patches = grid_depth * grid_size * grid_size
+        ppo_mask_ratio = cfgs_ppo.get('mask_ratio', 0.9)
+        ppo_num_visible = max(1, int(num_patches * (1 - ppo_mask_ratio)))
+        ppo_warmup_epochs = cfgs_ppo.get('warmup_epochs', 10)
+        ppo_update_every = cfgs_ppo.get('update_every', 1)
+        ppo_explore_eps = float(cfgs_ppo.get('explore_eps', 0.05))
+        ppo_entropy_warn = float(cfgs_ppo.get('entropy_warn', 2.0))
+        mask_policy = TATSPolicy(
+            in_dim=encoder.backbone.embed_dim,
+            grid_depth=grid_depth,
+            grid_size=grid_size,
+            embed_dim=cfgs_ppo.get('embed_dim', 384),
+            traj_attn=cfgs_ppo.get('traj_attn', True),
+            num_blocks=cfgs_ppo.get('num_traj_attn_blocks', 1),
+            num_heads=cfgs_ppo.get('num_heads', 8),
+            mlp_ratio=cfgs_ppo.get('mlp_ratio', 4.0),
+            qkv_bias=cfgs_ppo.get('qkv_bias', False),
+            drop=cfgs_ppo.get('drop_rate', 0.0),
+            approx=cfgs_ppo.get('traj_approx', 'orthoformer'),
+            num_landmarks=cfgs_ppo.get('num_landmarks', 128),
+            softmax_temp=cfgs_ppo.get('softmax_temp', 1.0),
+            uniform_power=uniform_power,
+        ).to(device)
+        mask_policy_opt = torch.optim.AdamW(
+            mask_policy.parameters(),
+            lr=cfgs_ppo.get('lr', 1e-4),
+            weight_decay=cfgs_ppo.get('weight_decay', 0.0),
+            betas=cfgs_ppo.get('betas', betas),
+            eps=cfgs_ppo.get('eps', eps),
+        )
+        ppo_buffer = PPORolloutBuffer(store_on_cpu=cfgs_ppo.get('buffer_on_cpu', False))
+        logger.info(f'PPO mask: {ppo_num_visible}/{num_patches} context tokens, '
+                    f'random masking for the first {ppo_warmup_epochs} epochs')
+    elif use_rl_mask:
         logger.info('Initializing trajectory-aware RL mask policy')
         policy_embed_dim = cfgs_rl_mask.get('embed_dim', 256)
         policy_depth = cfgs_rl_mask.get('depth', 2)
@@ -354,7 +405,10 @@ def main(args, resume_preempt=False):
         target_encoder = DistributedDataParallel(target_encoder)
         for p in target_encoder.parameters():
             p.requires_grad = False
-        if mask_policy is not None:
+        if use_ppo_mask:
+            # -- no static_graph: the policy does no backward during the warmup epochs
+            mask_policy = DistributedDataParallel(mask_policy)
+        elif mask_policy is not None:
             mask_policy = DistributedDataParallel(mask_policy, static_graph=True)
 
     # -- momentum schedule
@@ -396,7 +450,8 @@ def main(args, resume_preempt=False):
             'opt': optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'target_encoder': target_encoder.state_dict(),
-            'mask_policy': None if mask_policy is None else mask_policy.state_dict(),
+            'mask_policy': None if mask_policy is None else unwrap_policy(mask_policy).state_dict(),
+            'mask_policy_algo': rl_algo if use_rl_mask else None,
             'mask_policy_opt': None if mask_policy_opt is None else mask_policy_opt.state_dict(),
             'epoch': epoch,
             'loss': loss_meter.avg,
@@ -482,7 +537,34 @@ def main(args, resume_preempt=False):
             policy_entropy = None
             policy_motion = None
             reward = None
-            if mask_policy is not None:
+            ppo_rollout = None
+            ppo_stats = None
+            if use_ppo_mask:
+                # -- TATS: sample the context tokens from the trajectory-attention
+                # policy, conditioned on the context encoder's patch embeddings
+                if epoch >= ppo_warmup_epochs:
+                    backbone = encoder.module.backbone if use_distributed else encoder.backbone
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                        ppo_state = backbone.patch_embed(clips)  # [B, N, D]
+                        policy_logits, policy_values = unwrap_policy(mask_policy)(ppo_state)
+                    if torch.isfinite(policy_logits).all() and torch.isfinite(policy_values).all():
+                        _me, _mp = sample_tats_masks(policy_logits, ppo_num_visible, ppo_explore_eps)
+                        ppo_rollout = dict(
+                            state=ppo_state,
+                            actions=_mp,
+                            old_log_probs=token_log_probs(policy_logits, _mp, ppo_explore_eps),
+                            old_values=policy_values,
+                        )
+                        policy_entropy_value = tats_policy_entropy(policy_logits, ppo_explore_eps).mean()
+                    else:
+                        # -- never crash the backbone run on a broken policy: fall
+                        # back to random masks and skip this rollout
+                        logger.warning('Non-finite mask-policy output; using random masks this step')
+                        _me, _mp = sample_random_masks(clips.size(0), num_patches, ppo_num_visible, device)
+                else:
+                    _me, _mp = sample_random_masks(clips.size(0), num_patches, ppo_num_visible, device)
+                masks_enc, masks_pred = [_me], [_mp]
+            elif mask_policy is not None:
                 # -- one trajectory-aware placement logit map per clip
                 # (motion-energy + learned appearance), *not* pooled over
                 # the batch: every clip gets its own mask placement driven
@@ -516,11 +598,11 @@ def main(args, resume_preempt=False):
                 masks_enc, masks_pred, policy_log_prob, policy_entropy = sample_trajectory_masks(
                     policy_logits, (grid_depth, grid_size, grid_size), block_specs)
 
-            for _i, m in enumerate(mask_meters):
-                m.update(masks_enc[_i][0].size(-1))
+            for m, _me in zip(mask_meters, masks_enc):
+                m.update(_me[0].size(-1))
 
             def train_step():
-                nonlocal reward
+                nonlocal reward, ppo_stats
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
                 # --
@@ -577,7 +659,13 @@ def main(args, resume_preempt=False):
                 loss = loss_jepa + reg_coeff * loss_reg
 
                 per_sample_loss = None
-                if mask_policy is not None:
+                if ppo_rollout is not None:
+                    with torch.no_grad():
+                        # -- TATS reward: per-target-token prediction loss [B, N_pred]
+                        ppo_rollout['rewards'] = (
+                            torch.mean(torch.abs(z[0].float() - h[0].float())**loss_exp, dim=-1) / loss_exp
+                        ) * float(cfgs_ppo.get('reward_scale', 1.0))
+                elif mask_policy is not None and not use_ppo_mask:
                     with torch.no_grad():
                         per_sample_loss = per_sample_loss_fn(z, h)  # [B], detached
 
@@ -603,7 +691,30 @@ def main(args, resume_preempt=False):
                 optimizer.zero_grad()
                 optim_stats = adamw_logger(optimizer)
 
-                if mask_policy is not None:
+                if ppo_rollout is not None:
+                    ppo_buffer.add(**ppo_rollout)
+                    reward = ppo_rollout['rewards'].mean()
+                    if len(ppo_buffer) >= ppo_update_every:
+                        ppo_stats = ppo_update(
+                            mask_policy,
+                            mask_policy_opt,
+                            ppo_buffer,
+                            device,
+                            ppo_epochs=cfgs_ppo.get('ppo_epochs', 1),
+                            minibatch_size=cfgs_ppo.get('minibatch_size', None),
+                            clip_eps=cfgs_ppo.get('clip_eps', 0.2),
+                            dual_clip=cfgs_ppo.get('dual_clip', 3.0),
+                            policy_coef=cfgs_ppo.get('policy_coef', 1.0),
+                            value_coef=cfgs_ppo.get('value_coef', 0.5),
+                            entropy_coef=cfgs_ppo.get('entropy_coef', 0.01),
+                            normalize_advantage=cfgs_ppo.get('normalize_advantage', True),
+                            explore_eps=ppo_explore_eps,
+                            clip_grad=cfgs_ppo.get('clip_grad', 1.0),
+                            target_kl=cfgs_ppo.get('target_kl', 0.05),
+                            amp_dtype=dtype if mixed_precision else None,
+                        )
+                        ppo_buffer.clear()
+                elif mask_policy is not None and not use_ppo_mask:
                     mask_policy_opt.zero_grad()
                     # -- per-clip reward: clips whose sampled placement made
                     # prediction harder (higher loss) get lower reward, so
@@ -666,7 +777,31 @@ def main(args, resume_preempt=False):
                     iter_elapsed_time_ms)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     policy_log = ''
-                    if mask_policy is not None:
+                    if use_ppo_mask:
+                        if ppo_rollout is None:
+                            policy_log = '[ppo: random-mask warmup] '
+                        else:
+                            policy_log = (
+                                f'[reward={float(reward):.3f} '
+                                f'entropy={float(policy_entropy_value):.3f}'
+                            )
+                            if ppo_stats is not None:
+                                policy_log += (
+                                    f' pi_loss={ppo_stats["policy_loss"]:.4f}'
+                                    f' v_loss={ppo_stats["value_loss"]:.4f}'
+                                    f' clip={ppo_stats["clip_frac"]:.3f}'
+                                    f' kl={ppo_stats["approx_kl"]:.4f}'
+                                )
+                                if ppo_stats['skipped']:
+                                    policy_log += f' skipped={ppo_stats["skipped"]}'
+                                if ppo_stats['early_stop']:
+                                    policy_log += ' kl_stop'
+                            policy_log += '] '
+                            if float(policy_entropy_value) < ppo_entropy_warn:
+                                logger.warning(
+                                    f'Mask-policy entropy {float(policy_entropy_value):.3f} < {ppo_entropy_warn}: '
+                                    'the policy is collapsing onto few tokens')
+                    elif mask_policy is not None:
                         motion_scale = float(unwrap_policy(mask_policy).motion_scale)
                         policy_log = (
                             f'[reward={float(reward.mean()):.3f} '

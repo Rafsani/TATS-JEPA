@@ -63,15 +63,22 @@ def load_checkpoint(
                 f'loaded pretrained target encoder from epoch {epoch} with msg: {msg}'
             )
 
-        if (mask_policy is not None) and ('mask_policy' in checkpoint):
-            pretrained_dict = checkpoint['mask_policy']
-            policy_model = mask_policy.module if hasattr(mask_policy, 'module') else mask_policy
-            msg = policy_model.load_state_dict(pretrained_dict)
-            logger.info(f'loaded pretrained mask policy from epoch {epoch} with msg: {msg}')
-
-        if (mask_policy_opt is not None) and ('mask_policy_opt' in checkpoint):
-            mask_policy_opt.load_state_dict(checkpoint['mask_policy_opt'])
-            logger.info(f'loaded mask policy optimizer from epoch {epoch}')
+        if (mask_policy is not None) and (checkpoint.get('mask_policy') is not None):
+            # -- policy loading failures (e.g. a reinforce checkpoint resumed
+            # with rl_mask.algo=ppo) must not reset the backbone's epoch
+            try:
+                pretrained_dict = {
+                    k[len('module.'):] if k.startswith('module.') else k: v
+                    for k, v in checkpoint['mask_policy'].items()
+                }
+                policy_model = mask_policy.module if hasattr(mask_policy, 'module') else mask_policy
+                msg = policy_model.load_state_dict(pretrained_dict)
+                logger.info(f'loaded pretrained mask policy from epoch {epoch} with msg: {msg}')
+                if (mask_policy_opt is not None) and (checkpoint.get('mask_policy_opt') is not None):
+                    mask_policy_opt.load_state_dict(checkpoint['mask_policy_opt'])
+                    logger.info(f'loaded mask policy optimizer from epoch {epoch}')
+            except Exception as e:
+                logger.info(f'Could not load mask policy (starting it from scratch): {e}')
 
         # -- loading optimizer
         opt.load_state_dict(checkpoint['opt'])
