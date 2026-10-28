@@ -14,3 +14,9 @@ __pycache__/
 jepa/Jepa-logs/
 jepa/Jepa-logs-traj/
 jepa/pre-trained/
+jepa/Jepa-logs-ppo-snap/
+jepa/Jepa-logs-traj-snap/
+jepa/Jepa-logs-grpo/
+jepa/Jepa-logs-ppo/
+jepa/Jepa-logs-ppo-e34/
+jepa/eval-cls/
